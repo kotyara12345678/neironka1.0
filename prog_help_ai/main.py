@@ -1,12 +1,11 @@
 import pandas as pd
-from transformers import AutoTokenizer, AutoModel, pipeline
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from transformers import AutoTokenizer, AutoModel, pipeline
+import torch.nn.functional as F
 
-
-# ДАТАСЕТ
-
+# ===== ДАННЫЕ =====
 data = pd.DataFrame({
     'post': [
         "Помогите с Python, не могу разобраться с циклом",
@@ -16,7 +15,8 @@ data = pd.DataFrame({
         "Проблема с установкой библиотеки в Python",
         "Помогите с Spring Boot на Java"
     ],
-    'category': ['Python', 'Java', 'Frontend', 'Unity', 'Python', 'Java']
+    'category': ['Python', 'Java', 'Frontend', 'Unity', 'Python', 'Java'],
+    'price': [100, 200, 150, 250, 180, 220]  # примерные цены
 })
 
 categories = data['category'].unique()
@@ -24,62 +24,102 @@ category_to_idx = {cat: i for i, cat in enumerate(categories)}
 idx_to_category = {i: cat for cat, i in category_to_idx.items()}
 labels = data['category'].map(category_to_idx).tolist()
 
-
-# ЭМБЕДДИНГИ
-
+# ===== ЭМБЕДДИНГИ =====
 tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+base_model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
 
 def get_embedding(text):
     inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = base_model(**inputs)
     return outputs.last_hidden_state.mean(dim=1)
+
 
 embeddings = torch.cat([get_embedding(post) for post in data['post']], dim=0)
 
 
-# Нейросеть
-
+# ===== ПЕРВАЯ СЕТЬ (классификация) =====
 class SimpleClassifier(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, 64)
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)  # регуляризация
         self.fc2 = nn.Linear(64, num_classes)
-    
+
     def forward(self, x):
         x = self.fc1(x)
         x = self.relu(x)
+        x = self.dropout(x)
         x = self.fc2(x)
         return x
 
+
+# ===== ВТОРАЯ СЕТЬ (регрессор цены) =====
+class PriceRegressor(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        x = self.fc3(x)
+        return x
+
+
+# ===== ОБУЧЕНИЕ =====
 input_dim = embeddings.shape[1]
 num_classes = len(categories)
-net = SimpleClassifier(input_dim, num_classes)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(net.parameters(), lr=0.001)
+# Классификатор
+net1 = SimpleClassifier(input_dim, num_classes)
+criterion_cls = nn.CrossEntropyLoss()
+optimizer_cls = optim.Adam(net1.parameters(), lr=0.001)
 
 X = embeddings
 y = torch.tensor(labels)
 
-# Обучение нейросети
-for epoch in range(100):
-    optimizer.zero_grad()
-    outputs = net(X)
-    loss = criterion(outputs, y)
+for epoch in range(50):  # умеренное количество эпох
+    optimizer_cls.zero_grad()
+    outputs = net1(X)
+    loss = criterion_cls(outputs, y)
     loss.backward()
-    optimizer.step()
+    optimizer_cls.step()
+    if epoch % 10 == 0:
+        print(f"[Classifier] Epoch {epoch + 1}/50, Loss: {loss.item():.4f}")
 
+# Регрессор цены
+prices = torch.tensor(data['price'].values, dtype=torch.float32)
+net2 = PriceRegressor(input_dim)
+criterion_reg = nn.MSELoss()
+optimizer_reg = optim.Adam(net2.parameters(), lr=0.001)
 
-# Проверка токсичности / спама
+for epoch in range(50):
+    optimizer_reg.zero_grad()
+    outputs = net2(X).squeeze()
+    loss = criterion_reg(outputs, prices)
+    loss.backward()
+    optimizer_reg.step()
+    if epoch % 10 == 0:
+        print(f"[PriceRegressor] Epoch {epoch + 1}/50, Loss: {loss.item():.4f}")
 
+# ===== ТОКСИЧНОСТЬ / СПАМ =====
 toxic_classifier = pipeline("text-classification", model="unitary/toxic-bert")
+
 
 def check_toxicity(post, threshold=0.5):
     result = toxic_classifier(post)[0]
     return result['label'] == 'TOXIC' and result['score'] >= threshold
+
 
 def is_spam(post):
     if check_toxicity(post):
@@ -91,12 +131,9 @@ def is_spam(post):
     return False
 
 
-# Словарь технических терминов
-
+# ===== СЛОЖНОСТЬ =====
 TECH_TERMS = ["Python", "Java", "CSS", "HTML", "Unity", "Spring", "React", "Django", "Flask", "NumPy", "Pandas"]
 
-
-# Улучшенная оценка сложности
 
 def estimate_difficulty_smart(post):
     words = post.split()
@@ -104,7 +141,7 @@ def estimate_difficulty_smart(post):
     question_marks = post.count("?")
     unique_words = len(set(word.lower() for word in words))
     tech_count = sum(1 for term in TECH_TERMS if term.lower() in post.lower())
-    
+
     score = 0
     if length > 15:
         score += 2
@@ -114,7 +151,7 @@ def estimate_difficulty_smart(post):
     score += question_marks
     if unique_words > 10:
         score += 1
-    
+
     if score >= 4:
         return "Сложный"
     elif score >= 2:
@@ -123,39 +160,47 @@ def estimate_difficulty_smart(post):
         return "Легкий"
 
 
-# Поиск похожих постов
-
+# ===== ПОХОЖИЕ ПОСТЫ =====
 def find_similar_posts(new_emb, embeddings, data, top_k=3):
-    similarities = torch.nn.functional.cosine_similarity(new_emb, embeddings)
+    similarities = F.cosine_similarity(new_emb, embeddings)
     top_indices = similarities.topk(top_k).indices.tolist()
     return data.iloc[top_indices][["post", "category"]]
 
-# Основной цикл
 
+# ===== ОСНОВНОЙ ЦИКЛ =====
 while True:
-    new_post = input("\nВведите текст поста (или 'exit' для выхода): ")
+    new_post = input("\nВведите текст поста (или 'exit'): ")
     if new_post.lower() == 'exit':
         break
 
-    # Категория
     new_emb = get_embedding(new_post)
+
+    # Категория
     with torch.no_grad():
-        output = net(new_emb)
-        predicted_idx = torch.argmax(output, dim=1).item()
+        out1 = net1(new_emb)
+        probs = F.softmax(out1, dim=1)
+        predicted_idx = torch.argmax(probs, dim=1).item()
         predicted_category = idx_to_category[predicted_idx]
+
+    # Цена
+    with torch.no_grad():
+        out2 = net2(new_emb)
+        predicted_price = out2.item()
 
     # Сложность
     difficulty = estimate_difficulty_smart(new_post)
 
-    # Спам / токсичность
+    # Спам/токсичность
     spam_flag = is_spam(new_post)
 
     # Похожие посты
     similar_posts = find_similar_posts(new_emb, embeddings, data)
 
-    # Результат
+    # Итог
     print("\n--- РЕЗУЛЬТАТ ---")
     print("Категория:", predicted_category)
+    print("Вероятности категорий:", {idx_to_category[i]: f"{probs[0, i].item():.2f}" for i in range(len(categories))})
+    print("Примерная цена:", round(predicted_price, 2), "₽")
     print("Сложность:", difficulty)
     print("Спам/Токсичный:", spam_flag)
     print("Похожие посты:")
